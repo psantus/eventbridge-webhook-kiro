@@ -4,7 +4,12 @@
     {
       "Sid": "Logs",
       "Effect": "Allow",
-      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"],
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
       "Resource": "arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/runtimes/*"
     },
     {
@@ -12,6 +17,12 @@
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::${CODE_BUCKET}/*"
+    },
+    {
+      "Sid": "SignGitHubAppJwt",
+      "Effect": "Allow",
+      "Action": "kms:Sign",
+      "Resource": "${GITHUB_APP_KMS_KEY_ARN}"
     }
   ]
 }

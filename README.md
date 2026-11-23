@@ -28,7 +28,8 @@ EventBridge webhook event source --> Custom event bus
 | `poll-sqs-kiro.sh` | A: consumes the queue and starts Kiro |
 | `agentcore/invoke-input.jsonata` | B: builds the `InvokeAgentRuntime` request |
 | `agentcore/subscriber-policy.json` | B: delivery role permissions |
-| `agentcore/ack-agent/main.py`, `agentcore/ack-agent-*.json` | B: a minimal test agent that only acknowledges the PR |
+| `agentcore/ack-agent/main.py`, `agentcore/ack-agent-*.json` | B: a test agent that acknowledges the PR with a comment |
+| `github-app/create-app.py`, `github-app/import-key-to-kms.sh` | creates a GitHub App and moves its key into KMS |
 | `iam/*.json` | role trust and permissions (templates for `envsubst`) |
 
 ## What was tested
@@ -41,7 +42,8 @@ Tested on AWS CLI 2.42.1, Kiro CLI 3.5.0, in `us-east-1`, on November 23, 2026:
 - the JSONata transformer, including a login with a quote and a newline (the output stays valid JSON);
 - `poll-sqs-kiro.sh` against the real queue: it starts a detached session, acks the message, and the session can be resumed after it finishes;
 - a real GitHub hook on a private repo: the `ping` and a `pull_request` `opened` event both got 200 and the PR reached Kiro;
-- variant B end to end: a real PR on GitHub reached the test agent in `agentcore/ack-agent`, which logged the repo, PR number, action, delivery ID and the `github-pr-...` session ID.
+- variant B end to end: a real PR on GitHub reached the test agent in `agentcore/ack-agent`, which commented on the PR as a GitHub App, using a JWT signed with KMS;
+- the GitHub App manifest flow and the import of its key into KMS.
 
 ## Prerequisites
 
@@ -202,31 +204,50 @@ aws eventsv2 create-subscriber --name github-pr-to-agentcore --event-bus-arn "$B
   --on-failure-configuration "{\"Arn\":\"$DLQ_ARN\"}"
 ```
 
-### A test agent
+### A test agent that comments on the PR
 
-`agentcore/ack-agent/main.py` is a standard-library Python agent. It serves the AgentCore HTTP contract (`GET /ping`, `POST /invocations` on port 8080), logs one JSON line per PR and returns an ack. It is deployed as code from S3, so you don't need to build a container:
+`agentcore/ack-agent/main.py` serves the AgentCore HTTP contract (`GET /ping`, `POST /invocations` on port 8080). For each PR event it logs one JSON line and returns an ack. When `GITHUB_APP_ID` and `GITHUB_APP_KMS_KEY` are set, it also posts a comment on the PR as a GitHub App, with no GitHub secret anywhere (see [Acting on the repository](#acting-on-the-repository)):
+
+1. it signs the App's JWT (RS256) with `kms:Sign`, because the App's private key is in KMS;
+2. it gets the installation for the PR's repo (`GET /repos/{repo}/installation`);
+3. it gets an installation token limited to that one repo and to `pull_requests: write`;
+4. it posts the comment.
+
+The whole call takes a couple of seconds, well under the 30-second invocation timeout.
+
+First create the GitHub App and import its key (see [Acting on the repository](#acting-on-the-repository)). Then package the agent with `boto3` and deploy it as code from S3. No container is needed:
 
 ```bash
 export CODE_BUCKET=my-agent-code-${ACCOUNT_ID}
+export GITHUB_APP_ID=123456                               # from create-app.py
+export GITHUB_APP_KMS_KEY_ARN=arn:aws:kms:...             # from import-key-to-kms.sh
 aws s3api create-bucket --bucket "$CODE_BUCKET"
-(cd agentcore/ack-agent && zip -q /tmp/ack-agent.zip main.py)
+
+BUILD=$(mktemp -d)
+pip install -q --target "$BUILD" --platform manylinux2014_aarch64 --python-version 3.13 \
+  --only-binary=:all: --implementation cp boto3
+cp agentcore/ack-agent/main.py "$BUILD/"
+(cd "$BUILD" && zip -qr /tmp/ack-agent.zip . -x '*/__pycache__/*')
 aws s3 cp /tmp/ack-agent.zip "s3://$CODE_BUCKET/ack-agent.zip"
 
 aws iam create-role --role-name kiro-gh-ack-agent \
   --assume-role-policy-document "$(envsubst < agentcore/ack-agent-trust.json)"
 aws iam put-role-policy --role-name kiro-gh-ack-agent --policy-name runtime \
   --policy-document "$(envsubst < agentcore/ack-agent-policy.json)"
-sleep 20   # a create right after the role often fails with AccessDenied
+sleep 20   # a create right after the role is created can fail with AccessDenied
 
 export AGENT_RUNTIME_ARN=$(aws bedrock-agentcore-control create-agent-runtime \
   --agent-runtime-name kiro_gh_ack_agent \
-  --agent-runtime-artifact "{\"codeConfiguration\":{\"code\":{\"s3\":{\"bucket\":\"$CODE_BUCKET\",\"prefix\":\"ack-agent.zip\"}},\"runtime\":\"PYTHON_3_13\",\"entryPoint\":[\"main.py\"]}}" \
+  --agent-runtime-artifact "{\"codeConfiguration\":{\"code\":{\"s3\":{\"bucket\":\"${CODE_BUCKET}\",\"prefix\":\"ack-agent.zip\"}},\"runtime\":\"PYTHON_3_13\",\"entryPoint\":[\"main.py\"]}}" \
   --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/kiro-gh-ack-agent" \
   --network-configuration networkMode=PUBLIC --protocol-configuration serverProtocol=HTTP \
+  --environment-variables "GITHUB_APP_ID=${GITHUB_APP_ID},GITHUB_APP_KMS_KEY=${GITHUB_APP_KMS_KEY_ARN}" \
   --query agentRuntimeArn --output text)
 ```
 
-After a PR event, its acks are in the log group `/aws/bedrock-agentcore/runtimes/kiro_gh_ack_agent-<id>-DEFAULT`.
+After a PR event, the App's comment is on the PR, and the ack (with `comment` or `comment_error`) is in the log group `/aws/bedrock-agentcore/runtimes/kiro_gh_ack_agent-<id>-DEFAULT`.
+
+AgentCore answers `AccessDeniedException ... not authorized to perform: bedrock-agentcore:CreateAgentRuntime` (or `UpdateAgentRuntime`) both when the execution role is too new and when `--role-arn` is malformed. Check the ARN first. Under zsh, `$ACCOUNT_ID:role` expands as `$ACCOUNT_ID` with the `:r` modifier, which drops the `:r` and gives `...123456789012ole/...`. Write `${ACCOUNT_ID}:role`.
 
 The agent must accept IAM (SigV4) calls. An agent with a `customJWTAuthorizer` (OAuth) rejects EventBridge's calls.
 
@@ -275,7 +296,29 @@ To see what the bus really delivers, add a temporary subscriber with `--transfor
 
 ## Acting on the repository
 
-A GitHub webhook carries no token. To comment on the PR, use a GitHub App: its webhooks include `installation.id`, and the app exchanges its private key for a 1-hour installation token (`POST /app/installations/{id}/access_tokens`). Alternatively, keep a fine-grained PAT in Secrets Manager and let the agent's role read it.
+A GitHub webhook carries no token, and the GitHub API does not accept outside OIDC tokens such as AWS IAM outbound identity federation JWTs. An agent that wants to write to the repo needs a GitHub App, a PAT or an OAuth token. A GitHub App whose private key lives in KMS keeps every GitHub secret out of your code and storage:
+
+1. **Create the App.** `github-app/create-app.py` uses GitHub's [manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest). It opens your browser on a prefilled form for a private App with `pull_requests: write`, `metadata: read` and no webhook. You click **Create**, and the script exchanges the returned code for the App ID and private key. The key is written with mode 600 and never printed. GitHub has no API that skips the click.
+
+   ```bash
+   mkdir -m 700 -p ~/.gh-app
+   github-app/create-app.py my-pr-bot https://github.com/OWNER/REPO ~/.gh-app
+   ```
+
+   The App belongs to your user account. To create it under an organization, change the form action in the script to `https://github.com/organizations/ORG/settings/apps/new`.
+
+2. **Install it.** Open `https://github.com/apps/<slug>/installations/new`, choose **Only select repositories**, and select the repo. Creating the App does not install it.
+
+3. **Move the key into KMS.** The script imports the key into a new RSA_2048 `SIGN_VERIFY` key (`EXTERNAL` origin, non-exportable), checks that the public keys match, and prints the key ARN. Then delete the `.pem`. If you ever need a key outside KMS, GitHub can issue a new one.
+
+   ```bash
+   OPENSSL=/opt/homebrew/bin/openssl github-app/import-key-to-kms.sh ~/.gh-app/my-pr-bot.pem github-app-my-pr-bot
+   rm ~/.gh-app/my-pr-bot.pem
+   ```
+
+4. **Grant `kms:Sign`** on that key to the agent's execution role, as in `agentcore/ack-agent-policy.json`. To cut the agent off, revoke that permission or disable the key. To cut the App off, uninstall it.
+
+The installation token is requested for the PR's repo only and expires after 1 hour. Its permissions are capped by what the App has.
 
 ## Security
 
@@ -297,9 +340,10 @@ aws eventsv2 delete-event-source --event-source-arn "$SOURCE_ARN"
 aws eventsv2 delete-event-bus --event-bus-arn "$BUS_ARN"
 aws sqs delete-queue --queue-url "$QUEUE_URL"; aws sqs delete-queue --queue-url "$DLQ_URL"
 aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${AGENT_RUNTIME_ARN##*/}"   # test agent, if created
+aws kms schedule-key-deletion --key-id "$GITHUB_APP_KMS_KEY_ARN" --pending-window-in-days 7   # App key, if imported
 for r in kiro-gh-webhook-source kiro-gh-subscriber kiro-gh-agentcore-subscriber kiro-gh-ack-agent; do
   for p in $(aws iam list-role-policies --role-name $r --query PolicyNames --output text 2>/dev/null); do
     aws iam delete-role-policy --role-name $r --policy-name $p; done
   aws iam delete-role --role-name $r 2>/dev/null; done
-# and delete the hook in GitHub: gh api repos/$GH_REPO/hooks
+# and delete the hook in GitHub (gh api repos/$GH_REPO/hooks) and the App (Settings > Developer settings)
 ```
