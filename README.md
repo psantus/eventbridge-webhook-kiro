@@ -39,6 +39,7 @@ Tested on AWS CLI 2.42.1, Kiro CLI 3.5.0, in `us-east-1`, on November 23, 2026:
 - the filter: `opened`, `synchronize` and `reopened` pass; `closed` and `issues` events are dropped;
 - the JSONata transformer, including a login with a quote and a newline (the output stays valid JSON);
 - `poll-sqs-kiro.sh` against the real queue: it starts a detached session, acks the message, and the session can be resumed after it finishes;
+- a real GitHub hook on a private repo: the `ping` and a `pull_request` `opened` event both got 200 and the PR reached Kiro;
 - variant B up to AgentCore: EventBridge sent the request and AgentCore answered 404 for a runtime that does not exist. A call to a real agent was **not** tested.
 
 ## Prerequisites
@@ -168,7 +169,7 @@ kiro-cli chat --v3 --resume-id <sessionId>      # from kiro-runs/runs.tsv
 
 While the run is still going, a resume fails with `SessionHeldElsewhereError`, because the headless process owns the session.
 
-The default `KIRO_TRUST_TOOLS=read_file,grep_search` lets Kiro read and search files only. The script does not check out the PR branch, so Kiro sees `WORKDIR` as it is. Add a `gh pr checkout` step, and a matching tool trust, if you want it to see the diff.
+The default `KIRO_TRUST_TOOLS=read,grep_search` lets Kiro read and search files only. `read` is the V2 name for the read capability and also covers listing; with only `read_file`, Kiro could not list the checkout in the GitHub test. The script does not check out the PR branch, so Kiro sees `WORKDIR` as it is. Add a `gh pr checkout` step, and a matching tool trust, if you want it to see the diff.
 
 Since the message is acked when the session starts, a run that fails later is not retried. Its `.jsonl` keeps the error.
 

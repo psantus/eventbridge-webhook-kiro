@@ -12,7 +12,7 @@ set -euo pipefail
 
 : "${QUEUE_URL:?set QUEUE_URL}"
 WORKDIR="${WORKDIR:-$PWD}"
-KIRO_TRUST_TOOLS="${KIRO_TRUST_TOOLS:-read_file,grep_search}"
+KIRO_TRUST_TOOLS="${KIRO_TRUST_TOOLS:-read,grep_search}"
 RUNS_DIR="${RUNS_DIR:-$PWD/kiro-runs}"
 SESSION_WAIT="${SESSION_WAIT:-60}"
 ONCE="${ONCE:-0}"
