@@ -1,0 +1,12 @@
+{
+  "Filters": [
+    {
+      "Scope": "METADATA",
+      "Pattern": "{\"x-github-event\":[\"pull_request\"]}"
+    },
+    {
+      "Scope": "DATA",
+      "Pattern": "{\"action\":[\"opened\",\"synchronize\",\"reopened\"]}"
+    }
+  ]
+}

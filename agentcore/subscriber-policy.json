@@ -1,0 +1,15 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "bedrock-agentcore:InvokeAgentRuntime",
+      "Resource": ["${AGENT_RUNTIME_ARN}", "${AGENT_RUNTIME_ARN}/*"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sqs:SendMessage",
+      "Resource": "${DLQ_ARN}"
+    }
+  ]
+}
