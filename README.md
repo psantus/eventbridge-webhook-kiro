@@ -28,6 +28,7 @@ EventBridge webhook event source --> Custom event bus
 | `poll-sqs-kiro.sh` | A: consumes the queue and starts Kiro |
 | `agentcore/invoke-input.jsonata` | B: builds the `InvokeAgentRuntime` request |
 | `agentcore/subscriber-policy.json` | B: delivery role permissions |
+| `agentcore/ack-agent/main.py`, `agentcore/ack-agent-*.json` | B: a minimal test agent that only acknowledges the PR |
 | `iam/*.json` | role trust and permissions (templates for `envsubst`) |
 
 ## What was tested
@@ -40,7 +41,7 @@ Tested on AWS CLI 2.42.1, Kiro CLI 3.5.0, in `us-east-1`, on November 23, 2026:
 - the JSONata transformer, including a login with a quote and a newline (the output stays valid JSON);
 - `poll-sqs-kiro.sh` against the real queue: it starts a detached session, acks the message, and the session can be resumed after it finishes;
 - a real GitHub hook on a private repo: the `ping` and a `pull_request` `opened` event both got 200 and the PR reached Kiro;
-- variant B up to AgentCore: EventBridge sent the request and AgentCore answered 404 for a runtime that does not exist. A call to a real agent was **not** tested.
+- variant B end to end: a real PR on GitHub reached the test agent in `agentcore/ack-agent`, which logged the repo, PR number, action, delivery ID and the `github-pr-...` session ID.
 
 ## Prerequisites
 
@@ -83,7 +84,7 @@ sleep 15   # let IAM propagate
 
 aws eventsv2 create-event-source --name github --event-bus-arn "$BUS_ARN" \
   --configuration "{\"WebhookEventsConfiguration\":{
-    \"RoleArn\":\"arn:aws:iam::$ACCOUNT_ID:role/kiro-gh-webhook-source\",
+    \"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/kiro-gh-webhook-source\",
     \"AuthConfiguration\":{\"HmacAuthConfiguration\":{
       \"Algorithm\":\"SHA256\",\"Encoding\":\"HEX\",
       \"SignatureHttpHeader\":\"X-Hub-Signature-256\",\"SignaturePrefix\":\"sha256=\",
@@ -106,13 +107,13 @@ rm source.json
 
 ```bash
 export DLQ_URL=$(aws sqs create-queue --queue-name kiro-gh-dlq --query QueueUrl --output text)
-export DLQ_ARN=arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:kiro-gh-dlq
+export DLQ_ARN=arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:kiro-gh-dlq
 
 export QUEUE_URL=$(aws sqs create-queue --queue-name kiro-gh-tasks --attributes "{
   \"ReceiveMessageWaitTimeSeconds\":\"20\",
   \"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"
 }" --query QueueUrl --output text)
-export QUEUE_ARN=arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:kiro-gh-tasks
+export QUEUE_ARN=arn:aws:sqs:${AWS_REGION}:${ACCOUNT_ID}:kiro-gh-tasks
 ```
 
 The subscriber delivers with an IAM role, so the queue needs no resource policy.
@@ -131,7 +132,7 @@ jq -n --rawfile e transformer.jsonata \
 
 aws eventsv2 create-subscriber --name github-pr-to-kiro --event-bus-arn "$BUS_ARN" \
   --type UNORDERED \
-  --invoke-configuration "{\"RoleArn\":\"arn:aws:iam::$ACCOUNT_ID:role/kiro-gh-subscriber\",\"TargetArn\":\"$QUEUE_ARN\"}" \
+  --invoke-configuration "{\"RoleArn\":\"arn:aws:iam::${ACCOUNT_ID}:role/kiro-gh-subscriber\",\"TargetArn\":\"$QUEUE_ARN\"}" \
   --filter-configuration file://filter-configuration.json \
   --transformer file:///tmp/transformer.json \
   --on-failure-configuration "{\"Arn\":\"$DLQ_ARN\"}"
@@ -178,7 +179,7 @@ Since the message is acked when the session starts, a run that fails later is no
 A universal target calls an AWS API directly from the subscriber: here `InvokeAgentRuntime` on any AgentCore agent runtime, with no queue or poller.
 
 ```bash
-export AGENT_RUNTIME_ARN=arn:aws:bedrock-agentcore:$AWS_REGION:$ACCOUNT_ID:runtime/my_agent-XXXXXXXXXX
+export AGENT_RUNTIME_ARN=arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/my_agent-XXXXXXXXXX
 
 aws iam create-role --role-name kiro-gh-agentcore-subscriber \
   --assume-role-policy-document "$(envsubst < iam/trust-policy.json)"
@@ -188,7 +189,7 @@ sleep 15
 
 # only substitute AGENT_RUNTIME_ARN: the expression also contains $events
 INPUT=$(envsubst '${AGENT_RUNTIME_ARN}' < agentcore/invoke-input.jsonata)
-jq -n --arg role "arn:aws:iam::$ACCOUNT_ID:role/kiro-gh-agentcore-subscriber" --arg in "$INPUT" \
+jq -n --arg role "arn:aws:iam::${ACCOUNT_ID}:role/kiro-gh-agentcore-subscriber" --arg in "$INPUT" \
   '{TargetArn:"arn:aws:events:::aws-sdk:bedrockagentcore:invokeAgentRuntime", RoleArn:$role,
     UniversalTargetParameters:{Input:($in|rtrimstr("\n")), InvocationTimeoutSeconds:"30"}}' \
   > /tmp/agentcore-invoke.json
@@ -200,6 +201,34 @@ aws eventsv2 create-subscriber --name github-pr-to-agentcore --event-bus-arn "$B
   --batch-configuration MaxBatchSize=1,MaxBatchWindowInSeconds=0 \
   --on-failure-configuration "{\"Arn\":\"$DLQ_ARN\"}"
 ```
+
+### A test agent
+
+`agentcore/ack-agent/main.py` is a standard-library Python agent. It serves the AgentCore HTTP contract (`GET /ping`, `POST /invocations` on port 8080), logs one JSON line per PR and returns an ack. It is deployed as code from S3, so you don't need to build a container:
+
+```bash
+export CODE_BUCKET=my-agent-code-${ACCOUNT_ID}
+aws s3api create-bucket --bucket "$CODE_BUCKET"
+(cd agentcore/ack-agent && zip -q /tmp/ack-agent.zip main.py)
+aws s3 cp /tmp/ack-agent.zip "s3://$CODE_BUCKET/ack-agent.zip"
+
+aws iam create-role --role-name kiro-gh-ack-agent \
+  --assume-role-policy-document "$(envsubst < agentcore/ack-agent-trust.json)"
+aws iam put-role-policy --role-name kiro-gh-ack-agent --policy-name runtime \
+  --policy-document "$(envsubst < agentcore/ack-agent-policy.json)"
+sleep 20   # a create right after the role often fails with AccessDenied
+
+export AGENT_RUNTIME_ARN=$(aws bedrock-agentcore-control create-agent-runtime \
+  --agent-runtime-name kiro_gh_ack_agent \
+  --agent-runtime-artifact "{\"codeConfiguration\":{\"code\":{\"s3\":{\"bucket\":\"$CODE_BUCKET\",\"prefix\":\"ack-agent.zip\"}},\"runtime\":\"PYTHON_3_13\",\"entryPoint\":[\"main.py\"]}}" \
+  --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/kiro-gh-ack-agent" \
+  --network-configuration networkMode=PUBLIC --protocol-configuration serverProtocol=HTTP \
+  --query agentRuntimeArn --output text)
+```
+
+After a PR event, its acks are in the log group `/aws/bedrock-agentcore/runtimes/kiro_gh_ack_agent-<id>-DEFAULT`.
+
+The agent must accept IAM (SigV4) calls. An agent with a `customJWTAuthorizer` (OAuth) rejects EventBridge's calls.
 
 What the request contains (`agentcore/invoke-input.jsonata`):
 
@@ -244,6 +273,10 @@ aws sqs receive-message --queue-url "$QUEUE_URL" --wait-time-seconds 10 --visibi
 
 To see what the bus really delivers, add a temporary subscriber with `--transformer '{"Type":"WITH_METADATA"}'`. It delivers `Data`, `Metadata` and `SystemMetadata`.
 
+## Acting on the repository
+
+A GitHub webhook carries no token. To comment on the PR, use a GitHub App: its webhooks include `installation.id`, and the app exchanges its private key for a 1-hour installation token (`POST /app/installations/{id}/access_tokens`). Alternatively, keep a fine-grained PAT in Secrets Manager and let the agent's role read it.
+
 ## Security
 
 - **Prompt injection.** PR content comes from strangers. Keep tool trust minimal, never `--trust-all-tools` on a machine with credentials, and run in a throwaway checkout or container.
@@ -263,7 +296,8 @@ for s in $(aws eventsv2 list-subscribers --event-bus-arn "$BUS_ARN" --query 'Sub
 aws eventsv2 delete-event-source --event-source-arn "$SOURCE_ARN"
 aws eventsv2 delete-event-bus --event-bus-arn "$BUS_ARN"
 aws sqs delete-queue --queue-url "$QUEUE_URL"; aws sqs delete-queue --queue-url "$DLQ_URL"
-for r in kiro-gh-webhook-source kiro-gh-subscriber kiro-gh-agentcore-subscriber; do
+aws bedrock-agentcore-control delete-agent-runtime --agent-runtime-id "${AGENT_RUNTIME_ARN##*/}"   # test agent, if created
+for r in kiro-gh-webhook-source kiro-gh-subscriber kiro-gh-agentcore-subscriber kiro-gh-ack-agent; do
   for p in $(aws iam list-role-policies --role-name $r --query PolicyNames --output text 2>/dev/null); do
     aws iam delete-role-policy --role-name $r --policy-name $p; done
   aws iam delete-role --role-name $r 2>/dev/null; done
